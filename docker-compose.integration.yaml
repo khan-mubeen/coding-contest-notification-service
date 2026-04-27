@@ -1,0 +1,13 @@
+services:
+  notification-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      - API_BASE_URL=http://api:3000
+      - API_PREFIX=/api
+    ports:
+      - "4001:4001"
+    restart: unless-stopped
