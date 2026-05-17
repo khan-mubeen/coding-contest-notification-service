@@ -26,13 +26,14 @@ Basically: notifications and contest logic have different reasons to change, so 
 
 Pretty straightforward setup:
 
-```mermaid
-graph TD
-    A[REST API<br/>Subscriptions] --> B[Notification Service]
-    C[Background Worker<br/>Polling every 15s] --> B
-    D[Mailer<br/>Email sending] --> B
-    B --> E[Main API<br/>HTTP]
-    B --> F[SMTP<br/>Email Server]
+```
+Notification Service
+  ├─ REST API for managing subscriptions (user-facing)
+  ├─ Background worker polling the main API every 15s
+  └─ Mailer that sends actual emails
+         ↓
+    Talks to Main API (HTTP)
+    Talks to SMTP (email)
 ```
 
 The service keeps a snapshot of the last poll: submission counts, leaderboard state, contest status. When the next poll runs, it compares the new state with the snapshot. If anything changed, that's an event. If contest C1 had 3 submissions and now has 5, boom—2 new submission events. This snapshot is stored in `service-data.json` with subscriptions and delivery history.
@@ -43,22 +44,53 @@ If the service crashes, it just resumes from where it left off when it restarts.
 
 Here's how this service fits into the overall system:
 
-```mermaid
-graph TB
-    SMTP[SMTP Email Server<br/>Gmail, AWS SES, etc.]
-    
-    subgraph Service["Coding Contest Notification Service"]
-        API["REST API :4001<br/>POST /subscriptions<br/>PATCH /subscriptions/:id<br/>GET /deliveries<br/>POST /poll"]
-        Worker["Background Worker<br/>Every 15 seconds<br/>1. Poll Main API<br/>2. Compare snapshot<br/>3. Detect events<br/>4. Send emails<br/>5. Log deliveries"]
-        Storage[("service-data.json<br/>Subscriptions<br/>Delivery history<br/>Snapshots")]
-    end
-    
-    MainAPI["Main Contest API :3000<br/>/api/contests<br/>/api/submissions<br/>/api/scores"]
-    
-    SMTP <-->|SMTP<br/>587/465| Service
-    Service <-->|HTTP GET<br/>Every 15s| MainAPI
-    API --> Worker
-    Worker --> Storage
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        External World                            │
+├─────────────────────────────────────────────────────────────────┤
+│                     SMTP Email Server                            │
+│                  (Gmail, AWS SES, etc.)                          │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           │ SMTP (port 587/465)
+                           │ Email delivery
+                           │
+┌──────────────────────────┴──────────────────────────────────────┐
+│           Coding Contest Notification Service                    │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │ REST API (:4001)                                         │    │
+│  │  - POST /subscriptions (create subscription)             │    │
+│  │  - PATCH /subscriptions/:id (update preferences)         │    │
+│  │  - GET /deliveries (audit trail)                         │    │
+│  │  - POST /poll (manual trigger)                           │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                   │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │ Background Worker (every 15 seconds)                     │    │
+│  │  1. Poll Main API for contests/submissions/scores        │    │
+│  │  2. Compare with previous snapshot                       │    │
+│  │  3. Detect new events                                    │    │
+│  │  4. Send emails to subscribers matching events           │    │
+│  │  5. Log delivery status                                  │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                   │
+│  Storage: service-data.json                                      │
+│  - Subscriptions list                                            │
+│  - Delivery history                                              │
+│  - State snapshots                                               │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           │ HTTP GET (polls every 15s)
+                           │ Fetch: /contests, /submissions, /scores
+                           │
+┌──────────────────────────┴──────────────────────────────────────┐
+│              Main Contest API (:3000)                            │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │ /api/contests (contest info, is_active status)          │    │
+│  │ /api/contests/{id}/submissions (submission list)         │    │
+│  │ /api/submissions/{id}/scores (scoring info)              │    │
+│  └─────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 **Communication Flow:**
@@ -68,18 +100,20 @@ graph TB
 4. **Data Persistence**: JSON file-based storage (can upgrade to database)
 
 **Event Detection Pipeline:**
-```mermaid
-graph LR
-    A["Snapshot State<br/>C1: 3 submissions<br/>C1: active=false<br/>Leader: Team A"] 
-    B["New Poll Data<br/>C1: 5 submissions<br/>C1: active=true<br/>Leader: Team B"]
-    C["Events Detected<br/>NEW_SUBMISSION<br/>CONTEST_BECAME_ACTIVE<br/>LEADERBOARD_TOP_CHANGED"]
-    D["Apply Filters<br/>Who wants these?"]
-    E["Send Emails<br/>+ Log Deliveries"]
-    
-    A -->|Compare| B
-    B -->|Differences| C
-    C --> D
-    D --> E
+```
+Snapshot State                    New Poll                   Action
+(last known)        ────────→  (current data)  ─────────→  (Events)
+│                                   │                          │
+├─ C1: 3 submissions      ├─ C1: 5 submissions      ├─ NEW_SUBMISSION
+├─ C1: active=false       ├─ C1: active=true        ├─ CONTEST_BECAME_ACTIVE
+└─ Leader: Team A         └─ Leader: Team B         └─ LEADERBOARD_TOP_CHANGED
+                                     │
+                                     ↓
+                          Apply subscription filters
+                          (who wants these events?)
+                                     │
+                                     ↓
+                          Send emails + log deliveries
 ```
 
 ## What It Does
