@@ -10,87 +10,55 @@ The main idea is to keep notification complexity out of the core API. That way t
 
 ## Why Separate It Out?
 
-You could technically bolt email notifications into the main API, but it's a bad idea:
+You could build email notifications straight into the main API, but that's messy:
 
-**SMTP integration is messy.** Email servers are slow, flaky, and sometimes go down. If that's in the main API, a mail server hiccup slows down or breaks contest operations. Bad.
+SMTP is unreliable. Mail servers are slow and sometimes break. If email integration is in the main API, a SMTP failure can take down the whole contest system. Not good.
 
-**Retries and deduplication are complex.** If someone sends the same submission twice, you don't want to spam their inbox. And if an email fails, you need to retry intelligently. This logic belongs somewhere it can own its own state and retry queue—not mixed into request handlers.
+Retry logic is complicated. Handling duplicates, intelligent backoffs, and failed deliveries needs its own state management. It doesn't belong tangled up in API request handlers.
 
-**Different scaling needs.** Sending emails is I/O-bound (waiting for SMTP). Contest API work is database-bound. You want to scale these independently. One beefy API server handles contest traffic; one lightweight service handles email delivery.
+Different performance profiles. Email is I/O-heavy (waiting for SMTP). The contest API is CPU/database-heavy. These should scale independently.
 
-**Flexibility.** Separate service means you can upgrade notification behavior without touching contest code. Want to add Slack notifications later? Just extend this service, don't touch the API.
+Easier to iterate. With a separate service, you can improve notifications without risking the core API. Want to add Slack messages later? Add it here, not in the contest API.
 
-TL;DR: Each service has one reason to change. Notifications change for different reasons than contests do.
+Basically: notifications and contest logic have different reasons to change, so keep them separate.
 
 ## How It Works
 
 Pretty straightforward setup:
 
-```
-Notification Service
-  ├─ REST API for managing subscriptions (user-facing)
-  ├─ Background worker polling the main API every 15s
-  └─ Mailer that sends actual emails
-         ↓
-    Talks to Main API (HTTP)
-    Talks to SMTP (email)
+```mermaid
+graph TD
+    A[REST API<br/>Subscriptions] --> B[Notification Service]
+    C[Background Worker<br/>Polling every 15s] --> B
+    D[Mailer<br/>Email sending] --> B
+    B --> E[Main API<br/>HTTP]
+    B --> F[SMTP<br/>Email Server]
 ```
 
-The service is stateless except for one key thing: it keeps a snapshot of what it last saw. So if contest C1 had 3 submissions last poll and now has 5, it knows there are 2 new ones and fires events accordingly. This snapshot lives in `service-data.json` along with subscription and delivery records.
+The service keeps a snapshot of the last poll: submission counts, leaderboard state, contest status. When the next poll runs, it compares the new state with the snapshot. If anything changed, that's an event. If contest C1 had 3 submissions and now has 5, boom—2 new submission events. This snapshot is stored in `service-data.json` with subscriptions and delivery history.
 
-If the service crashes and restarts, it picks up where it left off. No missed events, no duplicates.
+If the service crashes, it just resumes from where it left off when it restarts. No missing events, no duplicates.
 
 ## Ecosystem Integration
 
 Here's how this service fits into the overall system:
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        External World                            │
-├─────────────────────────────────────────────────────────────────┤
-│                     SMTP Email Server                            │
-│                  (Gmail, AWS SES, etc.)                          │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-                           │ SMTP (port 587/465)
-                           │ Email delivery
-                           │
-┌──────────────────────────┴──────────────────────────────────────┐
-│           Coding Contest Notification Service                    │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │ REST API (:4001)                                         │    │
-│  │  - POST /subscriptions (create subscription)             │    │
-│  │  - PATCH /subscriptions/:id (update preferences)         │    │
-│  │  - GET /deliveries (audit trail)                         │    │
-│  │  - POST /poll (manual trigger)                           │    │
-│  └─────────────────────────────────────────────────────────┘    │
-│                                                                   │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │ Background Worker (every 15 seconds)                     │    │
-│  │  1. Poll Main API for contests/submissions/scores        │    │
-│  │  2. Compare with previous snapshot                       │    │
-│  │  3. Detect new events                                    │    │
-│  │  4. Send emails to subscribers matching events           │    │
-│  │  5. Log delivery status                                  │    │
-│  └─────────────────────────────────────────────────────────┘    │
-│                                                                   │
-│  Storage: service-data.json                                      │
-│  - Subscriptions list                                            │
-│  - Delivery history                                              │
-│  - State snapshots                                               │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-                           │ HTTP GET (polls every 15s)
-                           │ Fetch: /contests, /submissions, /scores
-                           │
-┌──────────────────────────┴──────────────────────────────────────┐
-│              Main Contest API (:3000)                            │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │ /api/contests (contest info, is_active status)          │    │
-│  │ /api/contests/{id}/submissions (submission list)         │    │
-│  │ /api/submissions/{id}/scores (scoring info)              │    │
-│  └─────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    SMTP[SMTP Email Server<br/>Gmail, AWS SES, etc.]
+    
+    subgraph Service["Coding Contest Notification Service"]
+        API["REST API :4001<br/>POST /subscriptions<br/>PATCH /subscriptions/:id<br/>GET /deliveries<br/>POST /poll"]
+        Worker["Background Worker<br/>Every 15 seconds<br/>1. Poll Main API<br/>2. Compare snapshot<br/>3. Detect events<br/>4. Send emails<br/>5. Log deliveries"]
+        Storage[("service-data.json<br/>Subscriptions<br/>Delivery history<br/>Snapshots")]
+    end
+    
+    MainAPI["Main Contest API :3000<br/>/api/contests<br/>/api/submissions<br/>/api/scores"]
+    
+    SMTP <-->|SMTP<br/>587/465| Service
+    Service <-->|HTTP GET<br/>Every 15s| MainAPI
+    API --> Worker
+    Worker --> Storage
 ```
 
 **Communication Flow:**
@@ -100,45 +68,37 @@ Here's how this service fits into the overall system:
 4. **Data Persistence**: JSON file-based storage (can upgrade to database)
 
 **Event Detection Pipeline:**
-```
-Snapshot State                    New Poll                   Action
-(last known)        ────────→  (current data)  ─────────→  (Events)
-│                                   │                          │
-├─ C1: 3 submissions      ├─ C1: 5 submissions      ├─ NEW_SUBMISSION
-├─ C1: active=false       ├─ C1: active=true        ├─ CONTEST_BECAME_ACTIVE
-└─ Leader: Team A         └─ Leader: Team B         └─ LEADERBOARD_TOP_CHANGED
-                                     │
-                                     ↓
-                          Apply subscription filters
-                          (who wants these events?)
-                                     │
-                                     ↓
-                          Send emails + log deliveries
+```mermaid
+graph LR
+    A["Snapshot State<br/>C1: 3 submissions<br/>C1: active=false<br/>Leader: Team A"] 
+    B["New Poll Data<br/>C1: 5 submissions<br/>C1: active=true<br/>Leader: Team B"]
+    C["Events Detected<br/>NEW_SUBMISSION<br/>CONTEST_BECAME_ACTIVE<br/>LEADERBOARD_TOP_CHANGED"]
+    D["Apply Filters<br/>Who wants these?"]
+    E["Send Emails<br/>+ Log Deliveries"]
+    
+    A -->|Compare| B
+    B -->|Differences| C
+    C --> D
+    D --> E
 ```
 
 ## What It Does
 
-Core stuff:
-
-- **Subscriptions**: Simple CRUD API. People can subscribe to contests and events. Each subscriber picks which event types they care about.
-- **Event Detection**: Watches for 4 types of events:
-  - Contest going live
-  - New submissions arriving
-  - Leaderboard rankings changing  
-  - Scores being updated
-- **Delivery**: Sends emails when events match subscriptions. Retries up to 3 times if it fails (with backoff). No duplicate sends for the same event.
-- **Background Worker**: Runs on a timer. Polls the API, checks for new events, sends emails. All async, doesn't block.
-- **Audit Trail**: Every delivery attempt is logged with status, retries, and error messages (if any).
+- **Subscriptions**: People can subscribe to contests and pick which events they care about. Simple CRUD endpoints.
+- **Event Detection**: Watches for contests going live, new submissions, leaderboard changes, and score updates.
+- **Email Delivery**: Sends emails to subscribers when events happen. Retries up to 3 times on failure with backoff. Won't send duplicates for the same event.
+- **Background Worker**: Polls the main API every 15 seconds, detects changes, and sends emails. Runs async so it doesn't block the REST API.
+- **Delivery Log**: Tracks every email attempt—what was sent, status, retries, errors.
 
 ## Design Notes
 
-**REST API**: Subscriptions are just resources. GET, POST, PATCH, DELETE—nothing fancy. Standard HTTP. Easy to test with curl.
+REST API: Standard HTTP resources. GET, POST, PATCH, DELETE for subscriptions. Nothing fancy, easy to test.
 
-**Polling, not webhooks**: We don't need the Main API to notify us. Instead, we poll it on a schedule. Why? Simpler. The Main API doesn't need to know about us at all. And if this service goes down and comes back up, it just resumes polling. No missed events.
+Polling over webhooks: We pull data from the main API on a schedule instead of waiting for push notifications. Simpler—the main API doesn't need to know we exist. Plus, if we crash and restart, we just resume polling with no missed events.
 
-**Background worker**: Event detection and email sending happen on a background timer, separate from the subscription API. That way a slow email send doesn't block someone trying to create a subscription.
+Background worker: Event detection and email sending run on a timer, separate from the subscription API. This way a slow email delivery doesn't block API requests.
 
-**Snapshot state**: This is key. We remember what we saw last poll. Contests, submission counts, leaderboard positions. If any of that changed, we fire events. This is how we detect things without needing the Main API to tell us. Simple and reliable.
+Snapshot state: We store what we saw last poll—contest status, submission counts, leaderboard rankings. When we poll again, we compare. Any difference triggers an event. Simple and reliable.
 
 ## API Endpoints
 
